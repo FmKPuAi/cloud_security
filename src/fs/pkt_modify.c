@@ -1,0 +1,157 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <pcre.h>
+#include <string.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include "nfq_queue.h"
+#include "pkt_crypt.h"
+
+#define OVECCOUNT 30    /* should be a multiple of 3 */
+
+#ifdef __LITTLE_ENDIAN
+#define IPQUAD(addr)	        \
+  ((unsigned char *)&addr)[0],  \
+    ((unsigned char *)&addr)[1],\
+    ((unsigned char *)&addr)[2],\
+    ((unsigned char *)&addr)[3]
+#else
+#define IPQUAD(addr)            \
+  ((unsigned char *)&addr)[3],  \
+    ((unsigned char *)&addr)[2],\
+    ((unsigned char *)&addr)[1],\
+    ((unsigned char *)&addr)[0]
+#endif
+
+
+unsigned char *start;
+int ipdata_len,iphead_len,tcphead_len,data_length,post_flag;
+unsigned int srcip, dstip;
+struct iphdr *ip_info;
+struct tcphdr *tcp_info;
+
+/* Check Ip */
+int Ip_Check(unsigned int destip)
+{
+	unsigned long diskip;
+	//unsigned int diskip = inet_addr("123.138.26.15");
+	diskip = (unsigned long)inet_addr("123.138.26.15");
+	
+	if(destip == diskip)
+		return 1;
+	return 0;
+}
+
+void Get_ip_info(unsigned char *data,int data_len)
+{
+    ip_info = (struct iphdr *)data;                                       /* Get ip header*/
+    tcp_info = (struct tcphdr*)(data + sizeof(*ip_info));  /* Get tcp header*/
+
+    ipdata_len = data_len;                                                /* ip packet's length */
+    iphead_len = ip_info->ihl * 4;                                        /* ip header's length'*/
+    tcphead_len = tcp_info->doff * 4;                                     /* tcp header's length */
+	 	
+    srcip = ip_info->saddr;
+    dstip = ip_info->daddr;
+
+}
+
+void Get_Data(unsigned char *data,char *buffer,int data_len)
+{
+    Get_ip_info(data,data_len);
+    start =  data + iphead_len + tcphead_len;              /* tcp content start position */   
+    data_length = ipdata_len - iphead_len - tcphead_len;
+    
+    if(ip_info->protocol == IPPROTO_TCP)
+    {
+		printf("Dest IP: %u.%u.%u.%u, Src IP:%u.%u.%u.%u\n",IPQUAD(dstip), IPQUAD(srcip));
+		if(!Ip_Check(dstip))	return ;                                /*Check ip */
+		printf("data_length = %d\n",data_length);	
+		int i;
+
+		/* Get tcp content */
+		for (i = 0; i < data_length; i++)      
+			buffer[i] = (char)*(start+i);
+		buffer[i] = '\0';
+		printf("################################\n");	
+		for(i = 0; i < data_length; i++)
+			printf("%c",buffer[i]);
+		printf("\n");
+		printf("################################\n");	
+    }
+}
+
+void Small_file_modify(int pos_start,int pos_end,int ovector_start,int ovector_end)
+{
+    int begin,end;
+    printf("Small File\n");
+    begin = ovector_start + 2;                                                       /* start position of file content  */
+    end = ovector_end - 2;                                                           /* end position of file content */ 
+    Encryption(start,begin,end,1);
+    nfq_tcp_compute_checksum_ipv4(tcp_info,ip_info);
+    
+}
+
+void Big_file_modify(int pos_start,int pos_end,int ovector_start,int ovector_end)
+{
+    int begin,end,flag = 0;
+    if(pos_start > 0 && pos_end < 0)
+    {
+		printf("Big File Starting...\n");
+		post_flag = 1;
+		flag = 1;
+		begin = ovector_start+ 2;
+		end = data_length - 1;
+    }
+    if(post_flag && pos_start < 0 && pos_end < 0)
+    {
+		printf("Big File content...\n");
+		begin = 0;
+		flag = 1;
+		end = data_length - 1;
+    }
+    if(post_flag && pos_start < 0 && pos_end > 0)
+    {
+		post_flag = 0;
+		printf("Big File ending...\n");
+		begin = 0;
+		flag = 1;
+		end = ovector_end - 2;
+    }
+	if(flag)
+	{
+		Encryption(start,begin,end,1);
+		nfq_tcp_compute_checksum_ipv4(tcp_info,ip_info);
+	}
+}
+
+void  Modify_up_pkt (unsigned char *data,int data_len)
+{
+    char buffer[2000];
+    pcre *re_start,*re_end;     	                                                            
+    const char *error;
+    int erroffset,pos_start,pos_end;
+    int ovector_start[OVECCOUNT],ovector_end[OVECCOUNT];                /* matching position(begin:ovector[2*i] and end:ovector[2*i+1]) */   
+    char pattern_start[] = "filename=.*?\nContent-Type:.*?\n";                        /* Regular expression matching */
+    char pattern_end[] = "\n------WebKitFormBoundary.*?\nContent.*?"; 
+    
+    Get_Data(data,buffer,data_len);
+    /*  Matching about upload file content */
+    re_start = pcre_compile(pattern_start, 0, &error, &erroffset, NULL);
+    re_end = pcre_compile(pattern_end, 0, &error, &erroffset, NULL);
+    pos_start = pcre_exec(re_start, NULL, buffer, data_length, 0, 0, ovector_start, OVECCOUNT); /* position of pattern_start */ 
+    pos_end = pcre_exec(re_end, NULL, buffer, data_length, 0, 0, ovector_end, OVECCOUNT);       /* position of pattern_end */
+    
+    printf("pos_start=%d,pos_end=%d\n",pos_start,pos_end);
+    if(pos_start > 0 && pos_end > 0) Small_file_modify(pos_start, pos_end,ovector_start[1],ovector_end[0]);
+    else	Big_file_modify(pos_start,pos_end,ovector_start[1], ovector_end[0]);
+    
+}
+void Modify_down_pkt (unsigned char *data)
+{
+
+}
+
